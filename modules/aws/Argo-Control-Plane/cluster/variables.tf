@@ -21,8 +21,12 @@
 # The control plane fronts SSO login, dispatch, and NATS for every data
 # plane - the highest blast-radius component in the system - so unlike the
 # per-tier data plane modules, this one is genuinely multi-AZ throughout:
-# 3 AZs, 3 private + 3 public subnets, one NAT Gateway per AZ (no shared
-# outbound path to lose), one node group spread across all 3 AZs.
+# N private + N public subnets, one NAT Gateway per AZ (no shared outbound
+# path to lose), one node group spread across all of them. N (the length
+# of availability_zones) is a config choice made at apply time, not fixed
+# by this module - pass 2 AZs for a leaner build or 3+ for full NATS
+# JetStream RAFT quorum tolerance (see the availability_zones description
+# below for that tradeoff).
 #
 # --------------------------------------------------------------------------------------
 
@@ -61,11 +65,11 @@ variable "vpc_cidr_block" {
 
 variable "availability_zones" {
   type        = list(string)
-  description = "Exactly 3 availability zones for the control plane's multi-AZ layout"
+  description = "Availability zones for the control plane's multi-AZ layout - a config choice, not fixed by this module. NATS JetStream itself still runs 3 replicas regardless of AZ count (set via the apps module); with fewer than 3 AZs, a single-AZ outage can take out a majority of those replicas and break quorum - an inherent property of RAFT, not something more AZs-per-node fixes on its own. 2 is the practical minimum for any node-level HA at all."
 
   validation {
-    condition     = length(var.availability_zones) == 3
-    error_message = "The control plane is built for exactly 3 AZs to match NATS JetStream's RAFT quorum size."
+    condition     = length(var.availability_zones) >= 2
+    error_message = "At least 2 AZs are required for basic node-level HA - a single AZ makes this module's whole per-AZ NAT Gateway/subnet design pointless."
   }
 }
 
@@ -122,17 +126,17 @@ variable "node_instance_types" {
 
 variable "node_min_size" {
   type    = number
-  default = 3
+  default = 2
 }
 
 variable "node_max_size" {
   type    = number
-  default = 6
+  default = 4
 }
 
 variable "node_desired_size" {
   type    = number
-  default = 3
+  default = 2
 }
 
 variable "node_capacity_type" {
