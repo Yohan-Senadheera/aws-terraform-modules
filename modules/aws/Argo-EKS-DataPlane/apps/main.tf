@@ -24,35 +24,42 @@ module "namespaces" {
   kubernetes_namespaces = merge(
     { for ns in var.namespaces : ns => {} },
     { (var.argocd_namespace) = {} },
+    { (var.system_namespace) = {} },
   )
 }
 
+# ONE shared argo-server + workflow-controller per data plane, in
+# system_namespace - matches the security review doc's data-plane diagram
+# ("system-pool - shared ... argo-server (argo-CLOUD-stage / -prod)") and
+# its explicit statement that "the workflow-controller and Argo Events
+# controllers see every namespace on their cluster - this is normal
+# Kubernetes control-plane behaviour." Tier isolation is real RBAC
+# (data-plane-tier-rbac.yaml / data-plane-debug-access-rbac.yaml, applied
+# via manifest_files), not separate controller instances per tier.
 module "argo_workflows" {
-  source   = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-  for_each = toset(var.namespaces)
+  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
 
   release_name     = "argo-workflows"
   chart_repo       = var.argo_helm_repo
   chart_name       = "argo-workflows"
   version_number   = var.argo_workflows_chart_version
-  namespace        = each.value
+  namespace        = var.system_namespace
   create_namespace = false
-  values           = lookup(var.argo_workflows_values, each.value, [])
+  values           = var.argo_workflows_values
 
   depends_on = [module.namespaces]
 }
 
 module "argo_events" {
-  source   = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-  for_each = toset(var.namespaces)
+  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
 
   release_name     = "argo-events"
   chart_repo       = var.argo_helm_repo
   chart_name       = "argo-events"
   version_number   = var.argo_events_chart_version
-  namespace        = each.value
+  namespace        = var.system_namespace
   create_namespace = false
-  values           = lookup(var.argo_events_values, each.value, [])
+  values           = var.argo_events_values
 
   depends_on = [module.namespaces]
 }

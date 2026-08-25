@@ -35,7 +35,13 @@
 
 variable "namespaces" {
   type        = list(string)
-  description = "Kubernetes namespaces to install a namespaced Argo Workflows + Argo Events release into, one pair per namespace (e.g. [\"argo-stage\", \"argo-prod\"])"
+  description = "Per-tier Kubernetes namespaces (e.g. [\"argo-stage\", \"argo-prod\"]) - created by this module, but Argo Workflows/Events themselves install once, cluster-wide, in system_namespace, not per entry here. RBAC (applied via manifest_files) is what actually isolates tiers, matching the security review doc's stated design."
+}
+
+variable "system_namespace" {
+  type        = string
+  description = "Namespace for the single shared argo-server/workflow-controller/argo-events install"
+  default     = "argo"
 }
 
 variable "argo_workflows_chart_version" {
@@ -57,15 +63,15 @@ variable "argo_helm_repo" {
 }
 
 variable "argo_workflows_values" {
-  type        = map(list(string))
-  description = "Per-namespace Helm values overrides (YAML strings, later entries win) for the argo-workflows release. Key must match an entry in var.namespaces."
-  default     = {}
+  type        = list(string)
+  description = "Helm values overrides (YAML strings, later entries win) for the argo-workflows release. Set controller.workflowNamespaces to var.namespaces (or leave cluster-wide) depending on how narrow you want the watch."
+  default     = []
 }
 
 variable "argo_events_values" {
-  type        = map(list(string))
-  description = "Per-namespace Helm values overrides (YAML strings, later entries win) for the argo-events release. Key must match an entry in var.namespaces."
-  default     = {}
+  type        = list(string)
+  description = "Helm values overrides (YAML strings, later entries win) for the argo-events release"
+  default     = []
 }
 
 variable "install_argocd" {
