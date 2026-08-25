@@ -18,217 +18,296 @@
 #
 # --------------------------------------------------------------------------------------
 #
-# Composes the tainted-node-pool + subnet-pinned + NAT-per-tier isolation
-# pattern already proven live on the Azure data plane, purely from existing
-# generic modules in this repo. Two tiers (stage, prod), each with its own
-# private subnet, its own NAT Gateway (own outbound IP), and its own EKS
-# managed node group. Prod nodes carry an "env=prod:NO_SCHEDULE" taint so
-# only workloads that explicitly tolerate it can land there.
+# Raw provider resource blocks, not wrapped through wso2/aws-terraform-modules
+# - this composite has no dependency on that repo (or any other WSO2 module
+# repo) at all. Same tainted-node-pool + subnet-pinned + NAT-per-tier
+# isolation pattern as before, just expressed directly.
 #
 # --------------------------------------------------------------------------------------
 
-module "vpc" {
-  source = "../../VPC"
-
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
-
-  vpc_cidr_block = var.vpc_cidr_block
+locals {
+  name = "${var.project}-${var.application}-${var.environment}"
 }
 
-module "internet_gateway" {
-  source = "../../Gateway"
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr_block
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = merge(var.tags, { Name = "${local.name}-vpc" })
+}
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
-
-  vpc_ids = [module.vpc.vpc_id]
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+  tags   = merge(var.tags, { Name = "${local.name}-igw" })
 }
 
 # --- Public subnets (NAT Gateway placement only, no workloads) ---
 
-module "stage_public_subnet" {
-  source = "../../VPC-Subnet"
+resource "aws_subnet" "stage_public" {
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.stage_public_subnet_cidr_block
+  availability_zone       = var.stage_availability_zones[0]
+  map_public_ip_on_launch = true
+  tags                    = merge(var.tags, { Name = "${local.name}-stage-public" })
+}
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-stage-public"
-  tags        = var.tags
+resource "aws_subnet" "prod_public" {
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.prod_public_subnet_cidr_block
+  availability_zone       = var.prod_availability_zones[0]
+  map_public_ip_on_launch = true
+  tags                    = merge(var.tags, { Name = "${local.name}-prod-public" })
+}
 
-  vpc_id                = module.vpc.vpc_id
-  availability_zones    = [var.stage_availability_zones[0]]
-  cidr_blocks           = [var.stage_public_subnet_cidr_block]
-  auto_assign_public_ip = true
-
-  custom_routes = [{
+resource "aws_route_table" "stage_public" {
+  vpc_id = aws_vpc.this.id
+  route {
     cidr_block = "0.0.0.0/0"
-    ep_type    = "gateway_id"
-    ep_id      = module.internet_gateway.gateway_id
-  }]
+    gateway_id = aws_internet_gateway.this.id
+  }
+  tags = merge(var.tags, { Name = "${local.name}-stage-public-rt" })
 }
 
-module "prod_public_subnet" {
-  source = "../../VPC-Subnet"
-
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-prod-public"
-  tags        = var.tags
-
-  vpc_id                = module.vpc.vpc_id
-  availability_zones    = [var.prod_availability_zones[0]]
-  cidr_blocks           = [var.prod_public_subnet_cidr_block]
-  auto_assign_public_ip = true
-
-  custom_routes = [{
+resource "aws_route_table" "prod_public" {
+  vpc_id = aws_vpc.this.id
+  route {
     cidr_block = "0.0.0.0/0"
-    ep_type    = "gateway_id"
-    ep_id      = module.internet_gateway.gateway_id
-  }]
+    gateway_id = aws_internet_gateway.this.id
+  }
+  tags = merge(var.tags, { Name = "${local.name}-prod-public-rt" })
 }
 
-# --- Per-tier NAT Gateways (own outbound IP each, matching the Azure pattern) ---
-
-module "stage_nat_gateway" {
-  source = "../../NAT-Gateway"
-
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-stage"
-  tags        = var.tags
-
-  subnet_id = values(module.stage_public_subnet.subnet_ids)[0]
+resource "aws_route_table_association" "stage_public" {
+  subnet_id      = aws_subnet.stage_public.id
+  route_table_id = aws_route_table.stage_public.id
 }
 
-module "prod_nat_gateway" {
-  source = "../../NAT-Gateway"
+resource "aws_route_table_association" "prod_public" {
+  subnet_id      = aws_subnet.prod_public.id
+  route_table_id = aws_route_table.prod_public.id
+}
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-prod"
-  tags        = var.tags
+# --- Per-tier NAT Gateways (own outbound IP each) ---
 
-  subnet_id = values(module.prod_public_subnet.subnet_ids)[0]
+resource "aws_eip" "stage_nat" {
+  domain     = "vpc"
+  tags       = merge(var.tags, { Name = "${local.name}-stage-nat-eip" })
+  depends_on = [aws_internet_gateway.this]
+}
+
+resource "aws_nat_gateway" "stage" {
+  allocation_id = aws_eip.stage_nat.id
+  subnet_id     = aws_subnet.stage_public.id
+  tags          = merge(var.tags, { Name = "${local.name}-stage-nat" })
+  depends_on    = [aws_internet_gateway.this]
+}
+
+resource "aws_eip" "prod_nat" {
+  domain     = "vpc"
+  tags       = merge(var.tags, { Name = "${local.name}-prod-nat-eip" })
+  depends_on = [aws_internet_gateway.this]
+}
+
+resource "aws_nat_gateway" "prod" {
+  allocation_id = aws_eip.prod_nat.id
+  subnet_id     = aws_subnet.prod_public.id
+  tags          = merge(var.tags, { Name = "${local.name}-prod-nat" })
+  depends_on    = [aws_internet_gateway.this]
 }
 
 # --- Private subnets (EKS nodes live here, tier-isolated egress via each
 #     tier's own NAT Gateway) ---
 
-module "stage_private_subnet" {
-  source = "../../VPC-Subnet"
+resource "aws_subnet" "stage_private" {
+  for_each = { for idx, az in var.stage_availability_zones : az => var.stage_subnet_cidr_blocks[idx] }
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-stage"
-  tags        = var.tags
-
-  vpc_id             = module.vpc.vpc_id
-  availability_zones = var.stage_availability_zones
-  cidr_blocks        = var.stage_subnet_cidr_blocks
-
-  custom_routes = [{
-    cidr_block = "0.0.0.0/0"
-    ep_type    = "nat_gateway_id"
-    ep_id      = module.stage_nat_gateway.nat_gateway_id
-  }]
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = each.value
+  availability_zone = each.key
+  tags              = merge(var.tags, { Name = "${local.name}-stage-${each.key}" })
 }
 
-module "prod_private_subnet" {
-  source = "../../VPC-Subnet"
+resource "aws_subnet" "prod_private" {
+  for_each = { for idx, az in var.prod_availability_zones : az => var.prod_subnet_cidr_blocks[idx] }
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-prod"
-  tags        = var.tags
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = each.value
+  availability_zone = each.key
+  tags              = merge(var.tags, { Name = "${local.name}-prod-${each.key}" })
+}
 
-  vpc_id             = module.vpc.vpc_id
-  availability_zones = var.prod_availability_zones
-  cidr_blocks        = var.prod_subnet_cidr_blocks
+resource "aws_route_table" "stage_private" {
+  vpc_id = aws_vpc.this.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.stage.id
+  }
+  tags = merge(var.tags, { Name = "${local.name}-stage-private-rt" })
+}
 
-  custom_routes = [{
-    cidr_block = "0.0.0.0/0"
-    ep_type    = "nat_gateway_id"
-    ep_id      = module.prod_nat_gateway.nat_gateway_id
-  }]
+resource "aws_route_table" "prod_private" {
+  vpc_id = aws_vpc.this.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.prod.id
+  }
+  tags = merge(var.tags, { Name = "${local.name}-prod-private-rt" })
+}
+
+resource "aws_route_table_association" "stage_private" {
+  for_each       = aws_subnet.stage_private
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.stage_private.id
+}
+
+resource "aws_route_table_association" "prod_private" {
+  for_each       = aws_subnet.prod_private
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.prod_private.id
 }
 
 # --- Per-tier security groups (extend the EKS-managed cluster SG, don't
-#     replace it - see EKS-Node-Group's security_group_ids description) ---
+#     replace it) ---
 
-module "stage_security_group" {
-  source = "../../Security-Group"
-
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-stage"
+resource "aws_security_group" "stage" {
+  name_prefix = "${local.name}-stage-"
   description = "Stage-tier data plane nodes"
-  tags        = var.tags
+  vpc_id      = aws_vpc.this.id
 
-  vpc_id = module.vpc.vpc_id
-  rules  = var.stage_security_group_rules
+  dynamic "ingress" {
+    for_each = [for r in var.stage_security_group_rules : r if r.direction == "ingress"]
+    content {
+      description     = "custom rule"
+      from_port       = ingress.value.from_port
+      to_port         = ingress.value.to_port
+      protocol        = ingress.value.protocol
+      cidr_blocks     = ingress.value.cidr_blocks
+      security_groups = ingress.value.security_groups
+    }
+  }
+
+  dynamic "egress" {
+    for_each = [for r in var.stage_security_group_rules : r if r.direction == "egress"]
+    content {
+      description     = "custom rule"
+      from_port       = egress.value.from_port
+      to_port         = egress.value.to_port
+      protocol        = egress.value.protocol
+      cidr_blocks     = egress.value.cidr_blocks
+      security_groups = egress.value.security_groups
+    }
+  }
+
+  tags = merge(var.tags, { Name = "${local.name}-stage-sg" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-module "prod_security_group" {
-  source = "../../Security-Group"
-
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-prod"
+resource "aws_security_group" "prod" {
+  name_prefix = "${local.name}-prod-"
   description = "Prod-tier data plane nodes"
-  tags        = var.tags
+  vpc_id      = aws_vpc.this.id
 
-  vpc_id = module.vpc.vpc_id
-  rules  = var.prod_security_group_rules
+  dynamic "ingress" {
+    for_each = [for r in var.prod_security_group_rules : r if r.direction == "ingress"]
+    content {
+      description     = "custom rule"
+      from_port       = ingress.value.from_port
+      to_port         = ingress.value.to_port
+      protocol        = ingress.value.protocol
+      cidr_blocks     = ingress.value.cidr_blocks
+      security_groups = ingress.value.security_groups
+    }
+  }
+
+  dynamic "egress" {
+    for_each = [for r in var.prod_security_group_rules : r if r.direction == "egress"]
+    content {
+      description     = "custom rule"
+      from_port       = egress.value.from_port
+      to_port         = egress.value.to_port
+      protocol        = egress.value.protocol
+      cidr_blocks     = egress.value.cidr_blocks
+      security_groups = egress.value.security_groups
+    }
+  }
+
+  tags = merge(var.tags, { Name = "${local.name}-prod-sg" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-# --- EKS cluster (uses the private subnets only; self-manages its own IAM
-#     role and OIDC provider since cluster_iam_role_arn is left null) ---
+# --- EKS cluster ---
 
-module "eks_cluster" {
-  source = "../../EKS-Cluster"
+resource "aws_iam_role" "eks_cluster" {
+  name = "${local.name}-eks-cluster-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+    }]
+  })
+  tags = var.tags
+}
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
 
-  kubernetes_version      = var.kubernetes_version
-  eks_vpc_id              = module.vpc.vpc_id
-  endpoint_private_access = true
-  endpoint_public_access  = var.endpoint_public_access
-  public_access_cidrs     = var.public_access_cidrs
-  service_ipv4_cidr       = null
-  cluster_subnet_ids = concat(
-    values(module.stage_private_subnet.subnet_ids),
-    values(module.prod_private_subnet.subnet_ids),
-  )
-  authentication_mode                         = "API"
-  bootstrap_cluster_creator_admin_permissions = true
-  enable_ebs_csi_driver                       = false
+resource "aws_eks_cluster" "this" {
+  name     = local.name
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = var.kubernetes_version
+
+  vpc_config {
+    subnet_ids = concat(
+      [for s in aws_subnet.stage_private : s.id],
+      [for s in aws_subnet.prod_private : s.id],
+    )
+    endpoint_private_access = true
+    endpoint_public_access  = var.endpoint_public_access
+    public_access_cidrs     = var.public_access_cidrs
+  }
+
+  access_config {
+    authentication_mode                         = "API"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
+  tags = var.tags
+
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
+}
+
+# OIDC provider - needed for per-env IRSA (pipeline pod -> deployment
+# target identity), not yet wired up here but the cluster needs this to
+# exist before that can be built.
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+  url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
+  tags            = var.tags
 }
 
 resource "aws_eks_addon" "core" {
   for_each = { for a in var.eks_addons : a.name => a }
 
-  cluster_name  = module.eks_cluster.eks_cluster_name
+  cluster_name  = aws_eks_cluster.this.name
   addon_name    = each.value.name
   addon_version = try(each.value.version, null)
-  depends_on    = [module.eks_cluster, module.stage_node_group, module.prod_node_group]
+
+  depends_on = [aws_eks_node_group.stage, aws_eks_node_group.prod]
 }
 
 # --- Cluster-admin access via native IAM (no unified cross-cloud identity) ---
@@ -236,16 +315,15 @@ resource "aws_eks_addon" "core" {
 resource "aws_eks_access_entry" "admin" {
   for_each = toset(var.admin_principal_arns)
 
-  cluster_name  = module.eks_cluster.eks_cluster_name
+  cluster_name  = aws_eks_cluster.this.name
   principal_arn = each.value
   type          = "STANDARD"
-  depends_on    = [module.eks_cluster]
 }
 
 resource "aws_eks_access_policy_association" "admin" {
   for_each = toset(var.admin_principal_arns)
 
-  cluster_name  = module.eks_cluster.eks_cluster_name
+  cluster_name  = aws_eks_cluster.this.name
   principal_arn = each.value
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
@@ -258,57 +336,182 @@ resource "aws_eks_access_policy_association" "admin" {
 
 # --- Node groups: stage (untainted), prod (tainted) ---
 
-module "stage_node_group" {
-  source = "../../EKS-Node-Group"
-
-  eks_cluster_name = module.eks_cluster.eks_cluster_name
-  node_group_name  = "stage"
-  subnet_ids       = values(module.stage_private_subnet.subnet_ids)
-  tags             = var.tags
-
-  instance_types  = var.stage_node_instance_types
-  capacity_type   = var.stage_node_capacity_type
-  min_size        = var.stage_node_min_size
-  max_size        = var.stage_node_max_size
-  desired_size    = var.stage_node_desired_size
-  max_unavailable = 1
-  k8s_version     = var.kubernetes_version
-
-  security_group_ids = [
-    module.eks_cluster.eks_security_group_id,
-    module.stage_security_group.security_group_id,
-  ]
-
-  labels = { tier = "stage" }
+resource "aws_iam_role" "stage_node" {
+  name = "${local.name}-stage-node-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+  tags = var.tags
 }
 
-module "prod_node_group" {
-  source = "../../EKS-Node-Group"
+resource "aws_iam_role_policy_attachment" "stage_node_worker" {
+  role       = aws_iam_role.stage_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
 
-  eks_cluster_name = module.eks_cluster.eks_cluster_name
-  node_group_name  = "prod"
-  subnet_ids       = values(module.prod_private_subnet.subnet_ids)
-  tags             = var.tags
+resource "aws_iam_role_policy_attachment" "stage_node_cni" {
+  role       = aws_iam_role.stage_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
 
-  instance_types  = var.prod_node_instance_types
-  capacity_type   = var.prod_node_capacity_type
-  min_size        = var.prod_node_min_size
-  max_size        = var.prod_node_max_size
-  desired_size    = var.prod_node_desired_size
-  max_unavailable = 1
-  k8s_version     = var.kubernetes_version
+resource "aws_iam_role_policy_attachment" "stage_node_ecr" {
+  role       = aws_iam_role.stage_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
 
-  security_group_ids = [
-    module.eks_cluster.eks_security_group_id,
-    module.prod_security_group.security_group_id,
+resource "aws_launch_template" "stage" {
+  name_prefix = "${local.name}-stage-"
+  vpc_security_group_ids = [
+    aws_eks_cluster.this.vpc_config[0].cluster_security_group_id,
+    aws_security_group.stage.id,
   ]
 
-  taints = {
-    env = {
-      value  = var.prod_node_taint_value
-      effect = "NO_SCHEDULE"
-    }
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(var.tags, { Name = "${local.name}-stage-node" })
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_eks_node_group" "stage" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "${local.name}-stage"
+  node_role_arn   = aws_iam_role.stage_node.arn
+  subnet_ids      = [for s in aws_subnet.stage_private : s.id]
+  instance_types  = var.stage_node_instance_types
+  capacity_type   = var.stage_node_capacity_type
+
+  launch_template {
+    id      = aws_launch_template.stage.id
+    version = "$Latest"
+  }
+
+  scaling_config {
+    min_size     = var.stage_node_min_size
+    max_size     = var.stage_node_max_size
+    desired_size = var.stage_node_desired_size
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  labels = { tier = "stage" }
+
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+
+  tags = var.tags
+
+  depends_on = [
+    aws_iam_role_policy_attachment.stage_node_worker,
+    aws_iam_role_policy_attachment.stage_node_cni,
+    aws_iam_role_policy_attachment.stage_node_ecr,
+  ]
+}
+
+resource "aws_iam_role" "prod_node" {
+  name = "${local.name}-prod-node-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "prod_node_worker" {
+  role       = aws_iam_role.prod_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "prod_node_cni" {
+  role       = aws_iam_role.prod_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "prod_node_ecr" {
+  role       = aws_iam_role.prod_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_launch_template" "prod" {
+  name_prefix = "${local.name}-prod-"
+  vpc_security_group_ids = [
+    aws_eks_cluster.this.vpc_config[0].cluster_security_group_id,
+    aws_security_group.prod.id,
+  ]
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(var.tags, { Name = "${local.name}-prod-node" })
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_eks_node_group" "prod" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "${local.name}-prod"
+  node_role_arn   = aws_iam_role.prod_node.arn
+  subnet_ids      = [for s in aws_subnet.prod_private : s.id]
+  instance_types  = var.prod_node_instance_types
+  capacity_type   = var.prod_node_capacity_type
+
+  launch_template {
+    id      = aws_launch_template.prod.id
+    version = "$Latest"
+  }
+
+  scaling_config {
+    min_size     = var.prod_node_min_size
+    max_size     = var.prod_node_max_size
+    desired_size = var.prod_node_desired_size
+  }
+
+  update_config {
+    max_unavailable = 1
   }
 
   labels = { tier = "prod" }
+
+  taint {
+    key    = "env"
+    value  = var.prod_node_taint_value
+    effect = "NO_SCHEDULE"
+  }
+
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+
+  tags = var.tags
+
+  depends_on = [
+    aws_iam_role_policy_attachment.prod_node_worker,
+    aws_iam_role_policy_attachment.prod_node_cni,
+    aws_iam_role_policy_attachment.prod_node_ecr,
+  ]
 }
