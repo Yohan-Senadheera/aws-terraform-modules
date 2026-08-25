@@ -17,15 +17,17 @@
 # under the License.
 #
 # --------------------------------------------------------------------------------------
+#
+# Raw kubernetes/helm resources, no dependency on wso2/common-terraform-modules.
+#
+# --------------------------------------------------------------------------------------
 
-module "namespaces" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/kubernetes/Namespaces?ref=main"
+resource "kubernetes_namespace_v1" "this" {
+  for_each = toset(concat(var.namespaces, [var.argocd_namespace, var.system_namespace]))
 
-  kubernetes_namespaces = merge(
-    { for ns in var.namespaces : ns => {} },
-    { (var.argocd_namespace) = {} },
-    { (var.system_namespace) = {} },
-  )
+  metadata {
+    name = each.value
+  }
 }
 
 # ONE shared argo-server + workflow-controller per data plane, in
@@ -36,55 +38,68 @@ module "namespaces" {
 # Kubernetes control-plane behaviour." Tier isolation is real RBAC
 # (data-plane-tier-rbac.yaml / data-plane-debug-access-rbac.yaml, applied
 # via manifest_files), not separate controller instances per tier.
-module "argo_workflows" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-
-  release_name     = "argo-workflows"
-  chart_repo       = var.argo_helm_repo
-  chart_name       = "argo-workflows"
-  version_number   = var.argo_workflows_chart_version
+resource "helm_release" "argo_workflows" {
+  name             = "argo-workflows"
+  repository       = var.argo_helm_repo
+  chart            = "argo-workflows"
+  version          = var.argo_workflows_chart_version
   namespace        = var.system_namespace
   create_namespace = false
   values           = var.argo_workflows_values
 
-  depends_on = [module.namespaces]
+  depends_on = [kubernetes_namespace_v1.this]
 }
 
-module "argo_events" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-
-  release_name     = "argo-events"
-  chart_repo       = var.argo_helm_repo
-  chart_name       = "argo-events"
-  version_number   = var.argo_events_chart_version
+resource "helm_release" "argo_events" {
+  name             = "argo-events"
+  repository       = var.argo_helm_repo
+  chart            = "argo-events"
+  version          = var.argo_events_chart_version
   namespace        = var.system_namespace
   create_namespace = false
   values           = var.argo_events_values
 
-  depends_on = [module.namespaces]
+  depends_on = [kubernetes_namespace_v1.this]
 }
 
-module "argocd" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-  count  = var.install_argocd ? 1 : 0
+resource "helm_release" "argocd" {
+  count = var.install_argocd ? 1 : 0
 
-  release_name     = "argocd"
-  chart_repo       = var.argocd_helm_repo
-  chart_name       = "argo-cd"
-  version_number   = var.argocd_chart_version
+  name             = "argocd"
+  repository       = var.argocd_helm_repo
+  chart            = "argo-cd"
+  version          = var.argocd_chart_version
   namespace        = var.argocd_namespace
   create_namespace = false
   values           = var.argocd_values
 
-  depends_on = [module.namespaces]
+  depends_on = [kubernetes_namespace_v1.this]
 }
 
-module "manifests" {
-  source   = "git::https://github.com/wso2/common-terraform-modules.git//modules/kubernetes/Manifest?ref=main"
-  for_each = { for idx, m in var.manifest_files : idx => m }
+# Several real pipeline manifests are multi-document YAML (Deployment +
+# Service + IngressRoute in one file, multiple RBAC objects, etc.) -
+# yamldecode() only parses a single document, so each file is split on a
+# bare "---" line first. This is a real fix, not a design choice: applying
+# these files through the previous wso2 kubernetes/Manifest module had the
+# exact same single-document limitation.
+locals {
+  manifest_documents = flatten([
+    for idx, m in var.manifest_files : [
+      for doc_idx, doc in [
+        for chunk in split("\n---\n", "\n${templatefile(m.location, m.template_map)}") : chunk
+        if trimspace(chunk) != ""
+        ] : {
+        key      = "${idx}-${doc_idx}"
+        manifest = yamldecode(doc)
+      }
+    ]
+  ])
+}
 
-  manifest_location = each.value.location
-  template_map      = each.value.template_map
+resource "kubernetes_manifest" "this" {
+  for_each = { for d in local.manifest_documents : d.key => d.manifest }
 
-  depends_on = [module.argo_workflows, module.argo_events, module.argocd]
+  manifest = each.value
+
+  depends_on = [helm_release.argo_workflows, helm_release.argo_events, helm_release.argocd]
 }
