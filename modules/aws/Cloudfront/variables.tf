@@ -237,3 +237,20 @@ variable "minimum_protocol_version" {
     error_message = "minimum_protocol_version must be one of: SSLv3, TLSv1, TLSv1_2016, TLSv1.1_2016, TLSv1.2_2018, TLSv1.2_2019, TLSv1.2_2021, TLSv1.2_2025, TLSv1.3_2025."
   }
 }
+
+variable "origin_custom_headers" {
+  description = <<-EOT
+    Custom headers CloudFront adds to every origin request (Eg: an
+    origin-verify secret the origin requires, so only this distribution can
+    reach it). List of { name, value } objects. Not declared sensitive: the
+    dynamic origin block iterates over it (for_each rejects sensitive
+    values), and the provider stores header values in plain state anyway —
+    callers passing a derived-sensitive value (Eg: random_password.result)
+    must wrap it in nonsensitive().
+  EOT
+  type = list(object({
+    name  = string
+    value = string
+  }))
+  default = []
+}

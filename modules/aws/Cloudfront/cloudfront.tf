@@ -30,6 +30,14 @@ resource "aws_cloudfront_distribution" "cloudfront_distribution" {
       origin_ssl_protocols   = var.origin_ssl_protocols
     }
 
+    dynamic "custom_header" {
+      for_each = var.origin_custom_headers
+      content {
+        name  = custom_header.value.name
+        value = custom_header.value.value
+      }
+    }
+
     dynamic "origin_shield" {
       for_each = var.origin_shield_enabled ? [1] : []
       content {
