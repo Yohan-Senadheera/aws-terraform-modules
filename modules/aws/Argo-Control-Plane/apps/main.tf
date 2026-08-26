@@ -28,6 +28,177 @@ resource "kubernetes_namespace_v1" "this" {
   }
 }
 
+# --- cert-manager + private client-CA for NATS mTLS. Real design change,
+#     not a one-time fix: cert-manager renews before expiry on its own,
+#     unlike Terraform's tls provider (common-terraform-modules' tls
+#     module), which only generates once at apply time. ---
+
+resource "kubernetes_namespace_v1" "cert_manager" {
+  count = var.install_cert_manager ? 1 : 0
+
+  metadata {
+    name = var.cert_manager_namespace
+  }
+}
+
+resource "helm_release" "cert_manager" {
+  count = var.install_cert_manager ? 1 : 0
+
+  name             = "cert-manager"
+  repository       = var.cert_manager_helm_repo
+  chart            = "cert-manager"
+  version          = var.cert_manager_chart_version
+  namespace        = var.cert_manager_namespace
+  create_namespace = false
+
+  set {
+    name  = "crds.enabled"
+    value = "true"
+  }
+
+  depends_on = [kubernetes_namespace_v1.cert_manager]
+}
+
+# Bootstrap: a self-signed Issuer to create the CA's own Certificate, then
+# a ClusterIssuer backed by that CA - this is the standard cert-manager
+# two-step pattern for standing up a private CA (a CA can't sign its own
+# initial cert without something to sign it with, hence the self-signed
+# bootstrap).
+resource "kubectl_manifest" "selfsigned_issuer" {
+  count = var.install_cert_manager ? 1 : 0
+
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Issuer"
+    metadata = {
+      name      = "selfsigned-bootstrap"
+      namespace = var.cert_manager_namespace
+    }
+    spec = { selfSigned = {} }
+  })
+
+  depends_on = [helm_release.cert_manager]
+}
+
+resource "kubectl_manifest" "nats_ca_certificate" {
+  count = var.install_cert_manager ? 1 : 0
+
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Certificate"
+    metadata = {
+      name      = "nats-client-ca"
+      namespace = var.cert_manager_namespace
+    }
+    spec = {
+      isCA       = true
+      commonName = "nats-client-ca"
+      secretName = "nats-client-ca-secret"
+      duration   = "8760h" # 1 year
+      privateKey = { algorithm = "ECDSA", size = 256 }
+      issuerRef = {
+        name = "selfsigned-bootstrap"
+        kind = "Issuer"
+      }
+    }
+  })
+
+  depends_on = [kubectl_manifest.selfsigned_issuer]
+}
+
+resource "kubectl_manifest" "nats_ca_issuer" {
+  count = var.install_cert_manager ? 1 : 0
+
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "ClusterIssuer"
+    metadata = {
+      name = "nats-client-ca-issuer"
+    }
+    spec = {
+      ca = { secretName = "nats-client-ca-secret" }
+    }
+  })
+
+  depends_on = [kubectl_manifest.nats_ca_certificate]
+}
+
+# The control plane's own NATS server certificate - the "wildcard"
+# identity the security review doc describes.
+resource "kubectl_manifest" "nats_server_certificate" {
+  count = var.install_cert_manager ? 1 : 0
+
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Certificate"
+    metadata = {
+      name      = "nats-server-cert"
+      namespace = var.namespace
+    }
+    spec = {
+      commonName  = "nats-server"
+      secretName  = "nats-server-cert"
+      duration    = "2160h" # 90 days - rotated automatically well before expiry
+      renewBefore = "360h"  # 15 days
+      privateKey  = { algorithm = "ECDSA", size = 256 }
+      usages      = ["server auth", "client auth"]
+      dnsNames    = ["nats.${var.namespace}.svc.cluster.local", "nats"]
+      issuerRef = {
+        name = "nats-client-ca-issuer"
+        kind = "ClusterIssuer"
+      }
+    }
+  })
+
+  depends_on = [kubectl_manifest.nats_ca_issuer]
+}
+
+# Per-data-plane client identities (row 10 of the security review's
+# auth table: mutual TLS, one cert per cloud x env). Issued here because
+# the CA lives here - the resulting cert/key get read back below and
+# exposed as outputs for manual, out-of-band distribution to each data
+# plane's own environment, same as control_plane_tunnel_host already is.
+resource "kubectl_manifest" "nats_client_certificate" {
+  for_each = var.install_cert_manager ? toset(var.nats_client_identities) : []
+
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Certificate"
+    metadata = {
+      name      = "nats-client-${each.value}"
+      namespace = var.namespace
+    }
+    spec = {
+      commonName  = each.value
+      secretName  = "nats-client-${each.value}-secret"
+      duration    = "2160h"
+      renewBefore = "360h"
+      privateKey  = { algorithm = "ECDSA", size = 256 }
+      usages      = ["client auth"]
+      issuerRef = {
+        name = "nats-client-ca-issuer"
+        kind = "ClusterIssuer"
+      }
+    }
+  })
+
+  depends_on = [kubectl_manifest.nats_ca_issuer]
+}
+
+# Read back each issued client cert's Secret so its PEM content can be
+# output - cert-manager writes tls.crt/tls.key/ca.crt into the Secret once
+# the Certificate reaches Ready, this just surfaces that content.
+data "kubernetes_secret_v1" "nats_client_certificate" {
+  for_each = var.install_cert_manager ? toset(var.nats_client_identities) : []
+
+  metadata {
+    name      = "nats-client-${each.value}-secret"
+    namespace = var.namespace
+  }
+
+  depends_on = [kubectl_manifest.nats_client_certificate]
+}
+
 resource "helm_release" "nats" {
   name             = "nats"
   repository       = var.nats_helm_repo
@@ -37,7 +208,7 @@ resource "helm_release" "nats" {
   create_namespace = false
   values           = var.nats_values
 
-  depends_on = [kubernetes_namespace_v1.this]
+  depends_on = [kubernetes_namespace_v1.this, kubectl_manifest.nats_server_certificate]
 }
 
 resource "helm_release" "argo_workflows" {

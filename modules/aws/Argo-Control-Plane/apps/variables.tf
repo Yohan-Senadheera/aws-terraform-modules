@@ -77,6 +77,33 @@ variable "nats_values" {
   default     = []
 }
 
+variable "install_cert_manager" {
+  type        = bool
+  description = "Install cert-manager and bootstrap a private client-CA for NATS mTLS - the security review doc's stated mechanism (\"client TLS certificates signed by a dedicated client-CA\") for the 5 identities: this control plane's own wildcard, plus one per data plane. cert-manager renews before expiry on its own, which is what makes rotation actually automatic (vs. a one-time tls provider generation)."
+  default     = true
+}
+
+variable "cert_manager_chart_version" {
+  type    = string
+  default = null
+}
+
+variable "cert_manager_helm_repo" {
+  type    = string
+  default = "https://charts.jetstack.io"
+}
+
+variable "cert_manager_namespace" {
+  type    = string
+  default = "cert-manager"
+}
+
+variable "nats_client_identities" {
+  type        = list(string)
+  description = "commonName for each data-plane NATS client certificate cert-manager issues, e.g. [\"azure-stage\", \"azure-prod\", \"aws-stage\", \"aws-prod\"]. One Certificate per entry; the resulting cert/key end up in a Kubernetes Secret named \"nats-client-<entry>\" in var.namespace, readable via this module's nats_client_cert_pems/nats_client_key_pems outputs for manual, out-of-band distribution to each data plane's own environment - same pattern already used for control_plane_tunnel_host."
+  default     = []
+}
+
 variable "manifest_files" {
   type = list(object({
     location     = string
