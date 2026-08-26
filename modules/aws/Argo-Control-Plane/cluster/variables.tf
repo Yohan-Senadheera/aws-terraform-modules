@@ -156,3 +156,14 @@ variable "security_group_rules" {
   description = "Additional security group rules, beyond the EKS-managed cluster security group"
   default     = []
 }
+
+variable "enable_bastion" {
+  type        = bool
+  description = "Whether to provision a bastion instance for admin access, via AWS Systems Manager Session Manager - no inbound security group rules, no open port."
+  default     = true
+}
+
+variable "bastion_instance_type" {
+  type    = string
+  default = "t3.micro"
+}

@@ -364,3 +364,87 @@ resource "aws_eks_node_group" "this" {
     aws_iam_role_policy_attachment.node_ecr,
   ]
 }
+
+# --- Bastion: native-identity admin access via SSM Session Manager - no
+#     inbound rule, no open port, ever. Reaches the SSM service endpoint
+#     through the first AZ's existing NAT Gateway egress. ---
+
+data "aws_ami" "bastion" {
+  count = var.enable_bastion ? 1 : 0
+
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_iam_role" "bastion" {
+  count = var.enable_bastion ? 1 : 0
+
+  name = "${local.name}-bastion-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "bastion_ssm" {
+  count = var.enable_bastion ? 1 : 0
+
+  role       = aws_iam_role.bastion[0].name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "bastion" {
+  count = var.enable_bastion ? 1 : 0
+
+  name = "${local.name}-bastion-profile"
+  role = aws_iam_role.bastion[0].name
+  tags = var.tags
+}
+
+resource "aws_security_group" "bastion" {
+  count = var.enable_bastion ? 1 : 0
+
+  name_prefix = "${local.name}-bastion-"
+  description = "Bastion instance - zero inbound rules by design, SSM Session Manager only"
+  vpc_id      = aws_vpc.this.id
+
+  egress {
+    description = "HTTPS to SSM service endpoints"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(var.tags, { Name = "${local.name}-bastion-sg" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_instance" "bastion" {
+  count = var.enable_bastion ? 1 : 0
+
+  ami                    = data.aws_ami.bastion[0].id
+  instance_type          = var.bastion_instance_type
+  subnet_id              = aws_subnet.private[var.availability_zones[0]].id
+  vpc_security_group_ids = [aws_security_group.bastion[0].id]
+  iam_instance_profile   = aws_iam_instance_profile.bastion[0].name
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tags = merge(var.tags, { Name = "${local.name}-bastion" })
+}

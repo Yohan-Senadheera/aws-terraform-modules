@@ -53,3 +53,8 @@ output "private_subnet_ids" {
 output "nat_gateway_public_ips" {
   value = { for az in var.availability_zones : az => aws_eip.nat[az].public_ip }
 }
+
+output "bastion_instance_id" {
+  description = "aws ssm start-session --target <this> to reach the bastion"
+  value       = var.enable_bastion ? aws_instance.bastion[0].id : null
+}
