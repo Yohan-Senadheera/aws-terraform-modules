@@ -17,63 +17,74 @@
 # under the License.
 #
 # --------------------------------------------------------------------------------------
+#
+# Raw kubernetes/helm resources, no dependency on wso2/common-terraform-modules.
+#
+# --------------------------------------------------------------------------------------
 
-module "namespace" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/kubernetes/Namespaces?ref=main"
-
-  kubernetes_namespaces = {
-    (var.namespace) = {}
+resource "kubernetes_namespace_v1" "this" {
+  metadata {
+    name = var.namespace
   }
 }
 
-module "nats" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-
-  release_name     = "nats"
-  chart_repo       = var.nats_helm_repo
-  chart_name       = "nats"
-  version_number   = var.nats_chart_version
+resource "helm_release" "nats" {
+  name             = "nats"
+  repository       = var.nats_helm_repo
+  chart            = "nats"
+  version          = var.nats_chart_version
   namespace        = var.namespace
   create_namespace = false
   values           = var.nats_values
 
-  depends_on = [module.namespace]
+  depends_on = [kubernetes_namespace_v1.this]
 }
 
-module "argo_workflows" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-
-  release_name     = "argo-workflows"
-  chart_repo       = var.argo_helm_repo
-  chart_name       = "argo-workflows"
-  version_number   = var.argo_workflows_chart_version
+resource "helm_release" "argo_workflows" {
+  name             = "argo-workflows"
+  repository       = var.argo_helm_repo
+  chart            = "argo-workflows"
+  version          = var.argo_workflows_chart_version
   namespace        = var.namespace
   create_namespace = false
   values           = var.argo_workflows_values
 
-  depends_on = [module.namespace]
+  depends_on = [kubernetes_namespace_v1.this]
 }
 
-module "argo_events" {
-  source = "git::https://github.com/wso2/common-terraform-modules.git//modules/helm/Helm-Release?ref=main"
-
-  release_name     = "argo-events"
-  chart_repo       = var.argo_helm_repo
-  chart_name       = "argo-events"
-  version_number   = var.argo_events_chart_version
+resource "helm_release" "argo_events" {
+  name             = "argo-events"
+  repository       = var.argo_helm_repo
+  chart            = "argo-events"
+  version          = var.argo_events_chart_version
   namespace        = var.namespace
   create_namespace = false
   values           = var.argo_events_values
 
-  depends_on = [module.namespace]
+  depends_on = [kubernetes_namespace_v1.this]
 }
 
-module "manifests" {
-  source   = "git::https://github.com/wso2/common-terraform-modules.git//modules/kubernetes/Manifest?ref=main"
-  for_each = { for idx, m in var.manifest_files : idx => m }
+# Several real pipeline manifests are multi-document YAML - yamldecode()
+# only parses a single document, so each file is split on a bare "---"
+# line first (same fix as the data-plane apps modules).
+locals {
+  manifest_documents = flatten([
+    for idx, m in var.manifest_files : [
+      for doc_idx, doc in [
+        for chunk in split("\n---\n", "\n${templatefile(m.location, m.template_map)}") : chunk
+        if trimspace(chunk) != ""
+        ] : {
+        key      = "${idx}-${doc_idx}"
+        manifest = yamldecode(doc)
+      }
+    ]
+  ])
+}
 
-  manifest_location = each.value.location
-  template_map      = each.value.template_map
+resource "kubernetes_manifest" "this" {
+  for_each = { for d in local.manifest_documents : d.key => d.manifest }
 
-  depends_on = [module.nats, module.argo_workflows, module.argo_events]
+  manifest = each.value
+
+  depends_on = [helm_release.nats, helm_release.argo_workflows, helm_release.argo_events]
 }
