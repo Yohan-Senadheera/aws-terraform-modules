@@ -201,3 +201,14 @@ variable "prod_node_taint_value" {
   description = "Value for the env taint applied to prod nodes (key is fixed to \"env\", effect fixed to NO_SCHEDULE) so only workloads that explicitly tolerate it land in prod"
   default     = "prod"
 }
+
+variable "enable_bastion" {
+  type        = bool
+  description = "Whether to provision a bastion instance for admin access to this data plane, via AWS Systems Manager Session Manager - no inbound security group rules, no open port, matching Azure Bastion's zero-inbound property. Uses the stage private subnet's existing NAT egress to reach the SSM service endpoint."
+  default     = true
+}
+
+variable "bastion_instance_type" {
+  type    = string
+  default = "t3.micro"
+}

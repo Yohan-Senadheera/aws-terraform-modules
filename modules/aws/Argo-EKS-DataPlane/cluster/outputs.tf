@@ -61,3 +61,8 @@ output "stage_nat_gateway_public_ip" {
 output "prod_nat_gateway_public_ip" {
   value = aws_eip.prod_nat.public_ip
 }
+
+output "bastion_instance_id" {
+  description = "aws ssm start-session --target <this> to reach the bastion"
+  value       = var.enable_bastion ? aws_instance.bastion[0].id : null
+}
