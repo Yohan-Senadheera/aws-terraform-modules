@@ -17,145 +17,241 @@
 # under the License.
 #
 # --------------------------------------------------------------------------------------
+#
+# Raw provider resource blocks, not wrapped through wso2/aws-terraform-modules
+# - this composite has no dependency on that repo (or any other WSO2 module
+# repo) at all.
+#
+# --------------------------------------------------------------------------------------
 
-module "vpc" {
-  source = "../../VPC"
-
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
-
-  vpc_cidr_block = var.vpc_cidr_block
+locals {
+  name = "${var.project}-${var.application}-${var.environment}"
 }
 
-module "internet_gateway" {
-  source = "../../Gateway"
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr_block
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = merge(var.tags, { Name = "${local.name}-vpc" })
+}
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
-
-  vpc_ids = [module.vpc.vpc_id]
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+  tags   = merge(var.tags, { Name = "${local.name}-igw" })
 }
 
 # --- Public subnets (one per AZ, NAT Gateway placement only) ---
 
-module "public_subnets" {
-  source   = "../../VPC-Subnet"
+resource "aws_subnet" "public" {
   for_each = { for idx, az in var.availability_zones : az => idx }
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-public"
-  tags        = var.tags
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.public_subnet_cidr_blocks[each.value]
+  availability_zone       = each.key
+  map_public_ip_on_launch = true
+  tags                    = merge(var.tags, { Name = "${local.name}-public-${each.key}" })
+}
 
-  vpc_id                = module.vpc.vpc_id
-  availability_zones    = [each.key]
-  cidr_blocks           = [var.public_subnet_cidr_blocks[each.value]]
-  auto_assign_public_ip = true
+resource "aws_route_table" "public" {
+  for_each = { for idx, az in var.availability_zones : az => idx }
 
-  custom_routes = [{
+  vpc_id = aws_vpc.this.id
+  route {
     cidr_block = "0.0.0.0/0"
-    ep_type    = "gateway_id"
-    ep_id      = module.internet_gateway.gateway_id
-  }]
+    gateway_id = aws_internet_gateway.this.id
+  }
+  tags = merge(var.tags, { Name = "${local.name}-public-${each.key}-rt" })
+}
+
+resource "aws_route_table_association" "public" {
+  for_each = aws_subnet.public
+
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public[each.key].id
 }
 
 # --- One NAT Gateway per AZ - no shared outbound path to lose ---
 
-module "nat_gateways" {
-  source   = "../../NAT-Gateway"
+resource "aws_eip" "nat" {
   for_each = { for idx, az in var.availability_zones : az => idx }
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = "${var.application}-${each.key}"
-  tags        = var.tags
+  domain     = "vpc"
+  tags       = merge(var.tags, { Name = "${local.name}-${each.key}-nat-eip" })
+  depends_on = [aws_internet_gateway.this]
+}
 
-  subnet_id = values(module.public_subnets[each.key].subnet_ids)[0]
+resource "aws_nat_gateway" "this" {
+  for_each = { for idx, az in var.availability_zones : az => idx }
+
+  allocation_id = aws_eip.nat[each.key].id
+  subnet_id     = aws_subnet.public[each.key].id
+  tags          = merge(var.tags, { Name = "${local.name}-${each.key}-nat" })
+  depends_on    = [aws_internet_gateway.this]
 }
 
 # --- Private subnets (nodes live here, each AZ egresses via its own NAT) ---
 
-module "private_subnets" {
-  source   = "../../VPC-Subnet"
+resource "aws_subnet" "private" {
   for_each = { for idx, az in var.availability_zones : az => idx }
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
-
-  vpc_id             = module.vpc.vpc_id
-  availability_zones = [each.key]
-  cidr_blocks        = [var.private_subnet_cidr_blocks[each.value]]
-
-  custom_routes = [{
-    cidr_block = "0.0.0.0/0"
-    ep_type    = "nat_gateway_id"
-    ep_id      = module.nat_gateways[each.key].nat_gateway_id
-  }]
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = var.private_subnet_cidr_blocks[each.value]
+  availability_zone = each.key
+  tags              = merge(var.tags, { Name = "${local.name}-private-${each.key}" })
 }
 
-module "security_group" {
-  source = "../../Security-Group"
+resource "aws_route_table" "private" {
+  for_each = { for idx, az in var.availability_zones : az => idx }
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
+  vpc_id = aws_vpc.this.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.this[each.key].id
+  }
+  tags = merge(var.tags, { Name = "${local.name}-private-${each.key}-rt" })
+}
+
+resource "aws_route_table_association" "private" {
+  for_each = aws_subnet.private
+
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.private[each.key].id
+}
+
+resource "aws_security_group" "this" {
+  name_prefix = "${local.name}-"
   description = "Control plane nodes"
-  tags        = var.tags
+  vpc_id      = aws_vpc.this.id
 
-  vpc_id = module.vpc.vpc_id
-  rules  = var.security_group_rules
+  dynamic "ingress" {
+    for_each = [for r in var.security_group_rules : r if r.direction == "ingress"]
+    content {
+      description     = "custom rule"
+      from_port       = ingress.value.from_port
+      to_port         = ingress.value.to_port
+      protocol        = ingress.value.protocol
+      cidr_blocks     = ingress.value.cidr_blocks
+      security_groups = ingress.value.security_groups
+    }
+  }
+
+  dynamic "egress" {
+    for_each = [for r in var.security_group_rules : r if r.direction == "egress"]
+    content {
+      description     = "custom rule"
+      from_port       = egress.value.from_port
+      to_port         = egress.value.to_port
+      protocol        = egress.value.protocol
+      cidr_blocks     = egress.value.cidr_blocks
+      security_groups = egress.value.security_groups
+    }
+  }
+
+  tags = merge(var.tags, { Name = "${local.name}-sg" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-# --- EKS cluster, spanning all 3 private subnets ---
+# --- EKS cluster, spanning all AZs ---
 
-module "eks_cluster" {
-  source = "../../EKS-Cluster"
+resource "aws_iam_role" "eks_cluster" {
+  name = "${local.name}-eks-cluster-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+    }]
+  })
+  tags = var.tags
+}
 
-  project     = var.project
-  environment = var.environment
-  region      = var.region
-  application = var.application
-  tags        = var.tags
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
 
-  kubernetes_version      = var.kubernetes_version
-  eks_vpc_id              = module.vpc.vpc_id
-  endpoint_private_access = true
-  endpoint_public_access  = var.endpoint_public_access
-  public_access_cidrs     = var.public_access_cidrs
-  service_ipv4_cidr       = null
-  cluster_subnet_ids      = [for az in var.availability_zones : values(module.private_subnets[az].subnet_ids)[0]]
+resource "aws_eks_cluster" "this" {
+  name     = local.name
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = var.kubernetes_version
 
-  authentication_mode                         = "API"
-  bootstrap_cluster_creator_admin_permissions = true
-  enable_ebs_csi_driver                       = true
+  vpc_config {
+    subnet_ids              = [for az in var.availability_zones : aws_subnet.private[az].id]
+    endpoint_private_access = true
+    endpoint_public_access  = var.endpoint_public_access
+    public_access_cidrs     = var.public_access_cidrs
+  }
+
+  access_config {
+    authentication_mode                         = "API"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
+  tags = var.tags
+
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
+}
+
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+  url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
+  tags            = var.tags
+}
+
+# --- EBS CSI driver, for JetStream's persistent volumes ---
+
+data "aws_iam_policy_document" "ebs_csi_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
+    }
+    principals {
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+      type        = "Federated"
+    }
+  }
+}
+
+resource "aws_iam_role" "ebs_csi" {
+  name               = "${local.name}-ebs-csi-role"
+  assume_role_policy = data.aws_iam_policy_document.ebs_csi_assume.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi" {
+  role       = aws_iam_role.ebs_csi.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }
 
 resource "aws_eks_addon" "core" {
   for_each = { for a in var.eks_addons : a.name => a }
 
-  cluster_name  = module.eks_cluster.eks_cluster_name
+  cluster_name  = aws_eks_cluster.this.name
   addon_name    = each.value.name
   addon_version = try(each.value.version, null)
-  depends_on    = [module.eks_cluster, module.node_group]
+
+  depends_on = [aws_eks_cluster.this, aws_eks_node_group.this]
 }
 
 resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name             = module.eks_cluster.eks_cluster_name
+  cluster_name             = aws_eks_cluster.this.name
   addon_name               = "aws-ebs-csi-driver"
-  service_account_role_arn = module.eks_cluster.ebs_csi_driver_role_arn
-  depends_on               = [module.eks_cluster, module.node_group]
+  service_account_role_arn = aws_iam_role.ebs_csi.arn
+
+  depends_on = [aws_eks_cluster.this, aws_eks_node_group.this]
 }
 
 # --- Cluster-admin access via native IAM (no unified cross-cloud identity) ---
@@ -163,16 +259,15 @@ resource "aws_eks_addon" "ebs_csi_driver" {
 resource "aws_eks_access_entry" "admin" {
   for_each = toset(var.admin_principal_arns)
 
-  cluster_name  = module.eks_cluster.eks_cluster_name
+  cluster_name  = aws_eks_cluster.this.name
   principal_arn = each.value
   type          = "STANDARD"
-  depends_on    = [module.eks_cluster]
 }
 
 resource "aws_eks_access_policy_association" "admin" {
   for_each = toset(var.admin_principal_arns)
 
-  cluster_name  = module.eks_cluster.eks_cluster_name
+  cluster_name  = aws_eks_cluster.this.name
   principal_arn = each.value
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
@@ -183,26 +278,89 @@ resource "aws_eks_access_policy_association" "admin" {
   depends_on = [aws_eks_access_entry.admin]
 }
 
-# --- One node group, spread across all 3 AZs ---
+# --- One node group, spread across all AZs ---
 
-module "node_group" {
-  source = "../../EKS-Node-Group"
+resource "aws_iam_role" "node" {
+  name = "${local.name}-node-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+  tags = var.tags
+}
 
-  eks_cluster_name = module.eks_cluster.eks_cluster_name
-  node_group_name  = "system"
-  subnet_ids       = [for az in var.availability_zones : values(module.private_subnets[az].subnet_ids)[0]]
-  tags             = var.tags
+resource "aws_iam_role_policy_attachment" "node_worker" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
 
+resource "aws_iam_role_policy_attachment" "node_cni" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "node_ecr" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_launch_template" "this" {
+  name_prefix = "${local.name}-"
+  vpc_security_group_ids = [
+    aws_eks_cluster.this.vpc_config[0].cluster_security_group_id,
+    aws_security_group.this.id,
+  ]
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(var.tags, { Name = "${local.name}-node" })
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_eks_node_group" "this" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "${local.name}-system"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = [for az in var.availability_zones : aws_subnet.private[az].id]
   instance_types  = var.node_instance_types
   capacity_type   = var.node_capacity_type
-  min_size        = var.node_min_size
-  max_size        = var.node_max_size
-  desired_size    = var.node_desired_size
-  max_unavailable = 1
-  k8s_version     = var.kubernetes_version
 
-  security_group_ids = [
-    module.eks_cluster.eks_security_group_id,
-    module.security_group.security_group_id,
+  launch_template {
+    id      = aws_launch_template.this.id
+    version = "$Latest"
+  }
+
+  scaling_config {
+    min_size     = var.node_min_size
+    max_size     = var.node_max_size
+    desired_size = var.node_desired_size
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+
+  tags = var.tags
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_worker,
+    aws_iam_role_policy_attachment.node_cni,
+    aws_iam_role_policy_attachment.node_ecr,
   ]
 }
