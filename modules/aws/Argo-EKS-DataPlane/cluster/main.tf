@@ -600,3 +600,48 @@ resource "aws_instance" "bastion" {
 
   tags = merge(var.tags, { Name = "${local.name}-bastion" })
 }
+
+# --- Per-env IRSA identities for pipeline pods. Trust is scoped to
+#     exactly one (namespace, ServiceAccount) pair per entry via the
+#     sub condition below - no wildcard, no cross-env reuse possible. ---
+
+data "aws_iam_policy_document" "deploy_identity_assume" {
+  for_each = var.deploy_identities
+
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:${each.value.namespace}:${each.value.service_account_name}"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    principals {
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+      type        = "Federated"
+    }
+  }
+}
+
+resource "aws_iam_role" "deploy_identity" {
+  for_each = var.deploy_identities
+
+  name               = "${local.name}-deploy-${each.key}"
+  assume_role_policy = data.aws_iam_policy_document.deploy_identity_assume[each.key].json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "deploy_identity" {
+  for_each = var.deploy_identities
+
+  name   = "${local.name}-deploy-${each.key}"
+  role   = aws_iam_role.deploy_identity[each.key].id
+  policy = each.value.policy_json
+}

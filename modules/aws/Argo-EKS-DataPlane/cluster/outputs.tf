@@ -66,3 +66,8 @@ output "bastion_instance_id" {
   description = "aws ssm start-session --target <this> to reach the bastion"
   value       = var.enable_bastion ? aws_instance.bastion[0].id : null
 }
+
+output "deploy_identity_role_arns" {
+  description = "Role ARN per deploy_identities entry - annotate the matching ServiceAccount with eks.amazonaws.com/role-arn: <this value>"
+  value       = { for k, r in aws_iam_role.deploy_identity : k => r.arn }
+}

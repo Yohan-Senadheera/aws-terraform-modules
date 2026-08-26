@@ -212,3 +212,13 @@ variable "bastion_instance_type" {
   type    = string
   default = "t3.micro"
 }
+
+variable "deploy_identities" {
+  type = map(object({
+    namespace            = string
+    service_account_name = string
+    policy_json          = string
+  }))
+  description = "Per-env IRSA identities for pipeline pods (\"Pipeline pod -> deployment target: Cloud-native Workload Identity Federation / IRSA, scoped per env\" per the security review doc) - no standing secret, credential minted per-pod by AWS itself. One IAM role per map entry, trusted via this cluster's own OIDC provider and scoped to exactly that (namespace, ServiceAccount) pair. policy_json is caller-supplied (this module has no opinion on what a pipeline actually needs to reach - e.g. {\"stage\" = {namespace=\"argo-stage\", service_account_name=\"is-deploy-stage\", policy_json=...}})."
+  default     = {}
+}
