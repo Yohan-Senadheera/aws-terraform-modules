@@ -213,6 +213,12 @@ variable "bastion_instance_type" {
   default = "t3.micro"
 }
 
+variable "eso_secretsmanager_key_prefix" {
+  type        = string
+  description = "Secrets Manager key-name prefix (glob) the eso IAM role may read. Defaults to \"*\" because this data plane's real ExternalSecrets (the IS-deploy pipeline's tier tokens) reference bare, unprefixed key names copied from an existing Azure Key Vault store - narrow this if/when those keys are ever renamed onto a path convention."
+  default     = "*"
+}
+
 variable "deploy_identities" {
   type = map(object({
     namespace            = string

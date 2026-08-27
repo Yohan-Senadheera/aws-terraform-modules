@@ -71,3 +71,8 @@ output "deploy_identity_role_arns" {
   description = "Role ARN per deploy_identities entry - annotate the matching ServiceAccount with eks.amazonaws.com/role-arn: <this value>"
   value       = { for k, r in aws_iam_role.deploy_identity : k => r.arn }
 }
+
+output "eso_role_arn" {
+  description = "IRSA role ARN for External Secrets Operator's own controller ServiceAccount (external-secrets/external-secrets)"
+  value       = aws_iam_role.eso.arn
+}

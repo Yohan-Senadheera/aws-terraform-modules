@@ -300,6 +300,57 @@ resource "aws_iam_openid_connect_provider" "eks" {
   tags            = var.tags
 }
 
+# --- External Secrets Operator IRSA - real secret names referenced by
+#     this data plane's own ExternalSecrets (the IS-deploy pipeline's
+#     tier tokens) were copied as-is from an existing Azure Key Vault
+#     store and don't follow a path-prefix convention (e.g. "GIT-BOT-PAT",
+#     not "argo/data-plane/git-bot-pat") - var.eso_secretsmanager_key_prefix
+#     defaults to "*" here for that reason, unlike the control plane's
+#     tightly-scoped "argo/control-plane/*". ---
+
+data "aws_iam_policy_document" "eso_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:external-secrets:external-secrets"]
+    }
+    principals {
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+      type        = "Federated"
+    }
+  }
+}
+
+resource "aws_iam_role" "eso" {
+  name               = "${local.name}-eso-role"
+  assume_role_policy = data.aws_iam_policy_document.eso_assume.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "eso" {
+  name = "${local.name}-eso-secretsmanager"
+  role = aws_iam_role.eso.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = "arn:aws:secretsmanager:*:*:secret:${var.eso_secretsmanager_key_prefix}"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:ListSecrets"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_eks_addon" "core" {
   for_each = { for a in var.eks_addons : a.name => a }
 
