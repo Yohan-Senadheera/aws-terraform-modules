@@ -58,3 +58,8 @@ output "bastion_instance_id" {
   description = "aws ssm start-session --target <this> to reach the bastion"
   value       = var.enable_bastion ? aws_instance.bastion[0].id : null
 }
+
+output "eso_role_arn" {
+  description = "IRSA role ARN for External Secrets Operator's own controller ServiceAccount (external-secrets/external-secrets)"
+  value       = aws_iam_role.eso.arn
+}

@@ -167,3 +167,9 @@ variable "bastion_instance_type" {
   type    = string
   default = "t3.micro"
 }
+
+variable "eso_secretsmanager_key_prefix" {
+  type        = string
+  description = "Secrets Manager key-name prefix (glob) the eso IAM role may read - scoped to this control plane's own secrets, matching the security review doc's stated scoping (\"IAM-scoped to argo/control-plane/*\") for the oauth2-proxy cookie-signing secret and the SSO client secret."
+  default     = "argo/control-plane/*"
+}

@@ -236,6 +236,57 @@ resource "aws_iam_role_policy_attachment" "ebs_csi" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }
 
+# --- External Secrets Operator IRSA - the doc's stated mechanism for the
+#     oauth2-proxy cookie-signing secret (90-day auto-rotation) and the
+#     SSO client secret, both read from AWS Secrets Manager under
+#     var.eso_secretsmanager_key_prefix ("argo/control-plane/*"). No
+#     serviceAccountRef in the ClusterSecretStore - ESO's own controller
+#     pod, annotated with this role's ARN, resolves credentials via IRSA
+#     through the default AWS SDK chain. ---
+
+data "aws_iam_policy_document" "eso_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:external-secrets:external-secrets"]
+    }
+    principals {
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+      type        = "Federated"
+    }
+  }
+}
+
+resource "aws_iam_role" "eso" {
+  name               = "${local.name}-eso-role"
+  assume_role_policy = data.aws_iam_policy_document.eso_assume.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "eso" {
+  name = "${local.name}-eso-secretsmanager"
+  role = aws_iam_role.eso.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = "arn:aws:secretsmanager:*:*:secret:${var.eso_secretsmanager_key_prefix}"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:ListSecrets"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_eks_addon" "core" {
   for_each = { for a in var.eks_addons : a.name => a }
 
