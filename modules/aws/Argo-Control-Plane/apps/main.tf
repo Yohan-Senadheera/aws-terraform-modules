@@ -235,6 +235,40 @@ resource "helm_release" "argo_events" {
   depends_on = [kubernetes_namespace_v1.this]
 }
 
+# --- External Secrets Operator - the doc's stated mechanism for the
+#     oauth2-proxy cookie-signing secret (90-day auto-rotation) and the
+#     SSO client secret, both read from AWS Secrets Manager. No
+#     serviceAccountRef in the resulting ClusterSecretStore - this
+#     annotates ESO's own controller ServiceAccount with the IRSA role
+#     from the cluster module, so it resolves credentials through the
+#     default AWS SDK chain, same as the EBS CSI driver does. ---
+
+resource "kubernetes_namespace_v1" "external_secrets" {
+  count = var.install_external_secrets ? 1 : 0
+
+  metadata {
+    name = var.eso_namespace
+  }
+}
+
+resource "helm_release" "external_secrets" {
+  count = var.install_external_secrets ? 1 : 0
+
+  name             = "external-secrets"
+  repository       = var.eso_helm_repo
+  chart            = "external-secrets"
+  version          = var.eso_chart_version
+  namespace        = var.eso_namespace
+  create_namespace = false
+
+  set {
+    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = var.eso_role_arn
+  }
+
+  depends_on = [kubernetes_namespace_v1.external_secrets]
+}
+
 # Several real pipeline manifests are multi-document YAML - yamldecode()
 # only parses a single document, so each file is split on a bare "---"
 # line first (same fix as the data-plane apps modules).
@@ -258,4 +292,34 @@ resource "kubernetes_manifest" "this" {
   manifest = each.value
 
   depends_on = [helm_release.nats, helm_release.argo_workflows, helm_release.argo_events]
+}
+
+# CRD-backed manifests (ESO's ClusterSecretStore/ExternalSecret) that need
+# to apply in the same run that installs their CRDs - kubernetes_manifest
+# validates against the CRD schema at plan time and fails when the CRD
+# doesn't exist yet, same class of problem already solved for
+# cert-manager's Certificate/Issuer above. `content` lets the caller
+# pre-process a real file (e.g. strip a redundant Namespace document)
+# before it's applied; `location` renders a file directly, same as
+# manifest_files.
+locals {
+  kubectl_manifest_documents = flatten([
+    for idx, m in var.kubectl_manifest_files : [
+      for doc_idx, doc in [
+        for chunk in split("\n---\n", "\n${m.content != null ? m.content : templatefile(m.location, m.template_map)}") : chunk
+        if trimspace(chunk) != ""
+        ] : {
+        key  = "${idx}-${doc_idx}"
+        body = doc
+      }
+    ]
+  ])
+}
+
+resource "kubectl_manifest" "extra" {
+  for_each = { for d in local.kubectl_manifest_documents : d.key => d.body }
+
+  yaml_body = each.value
+
+  depends_on = [helm_release.external_secrets, helm_release.nats, helm_release.argo_workflows, helm_release.argo_events]
 }

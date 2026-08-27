@@ -112,3 +112,40 @@ variable "manifest_files" {
   description = "Additional Kubernetes manifests to apply - dispatch-namespace RBAC, the SSO gateway (oauth2-proxy/credential-injector/link-resolver/submit-attributor), Ingress/Service for the real Load Balancer replacing the current single-VM Elastic IP. Content and ordering are entirely caller-supplied."
   default     = []
 }
+
+variable "install_external_secrets" {
+  type        = bool
+  description = "Install External Secrets Operator - the security review doc's stated mechanism for the oauth2-proxy cookie-signing secret (90-day auto-rotation) and the SSO client secret, both synced from AWS Secrets Manager."
+  default     = true
+}
+
+variable "eso_role_arn" {
+  type        = string
+  description = "IRSA role ARN for ESO's own controller ServiceAccount, from the cluster module's eso_role_arn output. Required when install_external_secrets is true."
+  default     = null
+}
+
+variable "eso_chart_version" {
+  type    = string
+  default = null
+}
+
+variable "eso_helm_repo" {
+  type    = string
+  default = "https://charts.external-secrets.io"
+}
+
+variable "eso_namespace" {
+  type    = string
+  default = "external-secrets"
+}
+
+variable "kubectl_manifest_files" {
+  type = list(object({
+    location     = optional(string)
+    content      = optional(string)
+    template_map = optional(map(string), {})
+  }))
+  description = "Manifests applied via the alekc/kubectl provider instead of kubernetes_manifest - required for anything backed by a CRD installed in this same apply (ESO's ClusterSecretStore/ExternalSecret), since kubernetes_manifest validates against the CRD schema at plan time and fails when the CRD doesn't exist yet. Set content directly to pre-process a real file's text (e.g. strip a document already managed elsewhere) instead of rendering location as-is."
+  default     = []
+}
