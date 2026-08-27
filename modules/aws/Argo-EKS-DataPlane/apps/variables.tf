@@ -112,3 +112,40 @@ variable "manifest_files" {
   description = "Additional Kubernetes manifests to apply after the Helm releases above - e.g. debug-access RBAC, EventSource/Sensor definitions, ArgoCD Application/AppProject objects. Each entry is a template file path plus the variables to render it with; content and ordering are entirely caller-supplied, this module does not know what's in them."
   default     = []
 }
+
+variable "install_external_secrets" {
+  type        = bool
+  description = "Install External Secrets Operator, syncing this data plane's own tier tokens from AWS Secrets Manager."
+  default     = true
+}
+
+variable "eso_role_arn" {
+  type        = string
+  description = "IRSA role ARN for ESO's own controller ServiceAccount, from the cluster module's eso_role_arn output. Required when install_external_secrets is true."
+  default     = null
+}
+
+variable "eso_chart_version" {
+  type    = string
+  default = null
+}
+
+variable "eso_helm_repo" {
+  type    = string
+  default = "https://charts.external-secrets.io"
+}
+
+variable "eso_namespace" {
+  type    = string
+  default = "external-secrets"
+}
+
+variable "kubectl_manifest_files" {
+  type = list(object({
+    location     = optional(string)
+    content      = optional(string)
+    template_map = optional(map(string), {})
+  }))
+  description = "Manifests applied via the alekc/kubectl provider instead of kubernetes_manifest - required for anything backed by a CRD installed in this same apply (ESO's ClusterSecretStore/ExternalSecret). Set content directly to pre-process a real file's text instead of rendering location as-is."
+  default     = []
+}

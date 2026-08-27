@@ -76,6 +76,38 @@ resource "helm_release" "argocd" {
   depends_on = [kubernetes_namespace_v1.this]
 }
 
+# --- External Secrets Operator - syncs this data plane's own tier tokens
+#     (currently referenced by the real ExternalSecret files as bare,
+#     unprefixed key names, copied from an existing Azure Key Vault store)
+#     from AWS Secrets Manager. Same IRSA-annotated-controller pattern as
+#     the control plane's install. ---
+
+resource "kubernetes_namespace_v1" "external_secrets" {
+  count = var.install_external_secrets ? 1 : 0
+
+  metadata {
+    name = var.eso_namespace
+  }
+}
+
+resource "helm_release" "external_secrets" {
+  count = var.install_external_secrets ? 1 : 0
+
+  name             = "external-secrets"
+  repository       = var.eso_helm_repo
+  chart            = "external-secrets"
+  version          = var.eso_chart_version
+  namespace        = var.eso_namespace
+  create_namespace = false
+
+  set {
+    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = var.eso_role_arn
+  }
+
+  depends_on = [kubernetes_namespace_v1.external_secrets]
+}
+
 # Several real pipeline manifests are multi-document YAML (Deployment +
 # Service + IngressRoute in one file, multiple RBAC objects, etc.) -
 # yamldecode() only parses a single document, so each file is split on a
@@ -102,4 +134,30 @@ resource "kubernetes_manifest" "this" {
   manifest = each.value
 
   depends_on = [helm_release.argo_workflows, helm_release.argo_events, helm_release.argocd]
+}
+
+# CRD-backed manifests (ESO's ClusterSecretStore/ExternalSecret) applied in
+# the same run that installs their CRDs - see the control-plane apps
+# module's identical mechanism for why kubectl_manifest, not
+# kubernetes_manifest, is required here.
+locals {
+  kubectl_manifest_documents = flatten([
+    for idx, m in var.kubectl_manifest_files : [
+      for doc_idx, doc in [
+        for chunk in split("\n---\n", "\n${m.content != null ? m.content : templatefile(m.location, m.template_map)}") : chunk
+        if trimspace(chunk) != ""
+        ] : {
+        key  = "${idx}-${doc_idx}"
+        body = doc
+      }
+    ]
+  ])
+}
+
+resource "kubectl_manifest" "extra" {
+  for_each = { for d in local.kubectl_manifest_documents : d.key => d.body }
+
+  yaml_body = each.value
+
+  depends_on = [helm_release.external_secrets, helm_release.argo_workflows, helm_release.argo_events, helm_release.argocd]
 }
