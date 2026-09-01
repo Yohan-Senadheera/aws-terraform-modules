@@ -80,6 +80,15 @@ resource "aws_cloudfront_distribution" "cloudfront_distribution" {
       }
     }
 
+    dynamic "lambda_function_association" {
+      for_each = var.lambda_function_associations
+      content {
+        event_type   = lambda_function_association.value.event_type
+        lambda_arn   = lambda_function_association.value.lambda_arn
+        include_body = lambda_function_association.value.include_body
+      }
+    }
+
     viewer_protocol_policy = var.viewer_protocol_policy
     min_ttl                = var.min_ttl
     default_ttl            = var.default_ttl

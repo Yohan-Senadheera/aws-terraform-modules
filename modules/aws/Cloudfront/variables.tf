@@ -254,3 +254,27 @@ variable "origin_custom_headers" {
   }))
   default = []
 }
+
+variable "lambda_function_associations" {
+  description = <<-EOT
+    Lambda@Edge functions attached to the default cache behavior. List of
+    { event_type, lambda_arn, include_body } objects. event_type is one of
+    viewer-request, origin-request, origin-response, viewer-response (at
+    most one function per event type); lambda_arn must be a published
+    function version ARN (not $LATEST) of a function in us-east-1.
+  EOT
+  type = list(object({
+    event_type   = string
+    lambda_arn   = string
+    include_body = optional(bool, false)
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for a in var.lambda_function_associations :
+      contains(["viewer-request", "origin-request", "origin-response", "viewer-response"], a.event_type)
+    ])
+    error_message = "event_type must be one of viewer-request, origin-request, origin-response, viewer-response."
+  }
+}
